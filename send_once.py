@@ -6,48 +6,40 @@ import urllib.request
 import urllib.parse
 from email.message import EmailMessage
 from datetime import datetime, timedelta
-
-# --- CONFIGURAÇÃO ---
-# O código agora lê diretamente do GitHub Secrets (Variáveis de Ambiente)
-RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
-RAPIDAPI_HOST = "skyscanner-flights-travel-api.p.rapidapi.com"
-
-GMAIL_USER = os.getenv("GMAIL_USER")
-GMAIL_PASS = os.getenv("GMAIL_PASS")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# Importa as configurações do seu arquivo security_config.py
+from security_config import get_email_credentials, get_telegram_credentials, get_required_secret
 
 def get_real_prices(origin_id="CGB", destination_id="OPS"):
     """
     Busca os preços reais da Azul e GOL usando a API Skyscanner via RapidAPI.
-    Usa urllib para evitar erro de 'module not found'.
+    Usa urllib para evitar erro de 'module not found' no GitHub Actions.
     """
-    if not RAPIDAPI_KEY:
-        print("❌ Erro: RAPIDAPI_KEY não configurada no GitHub Secrets.")
-        return None
-
-    # Define a data para daqui a 30 dias
-    data_voo = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
-    
-    params = {
-        "originSkyId": origin_id,
-        "destinationSkyId": destination_id,
-        "date": data_voo,
-        "adults": "1",
-        "cabinClass": "economy",
-        "currency": "BRL",
-        "market": "BR",
-        "countryCode": "BR"
-    }
-    
-    url = f"https://{RAPIDAPI_HOST}/flights/searchFlights?" + urllib.parse.urlencode(params)
-    
-    headers = {
-        "X-RapidAPI-Key": RAPIDAPI_KEY,
-        "X-RapidAPI-Host": RAPIDAPI_HOST
-    }
-
     try:
+        # Busca a chave da RapidAPI usando sua função de segurança
+        rapidapi_key = get_required_secret("RAPIDAPI_KEY")
+        rapidapi_host = "skyscanner-flights-travel-api.p.rapidapi.com"
+
+        # Define a data para daqui a 30 dias
+        data_voo = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
+        
+        params = {
+            "originSkyId": origin_id,
+            "destinationSkyId": destination_id,
+            "date": data_voo,
+            "adults": "1",
+            "cabinClass": "economy",
+            "currency": "BRL",
+            "market": "BR",
+            "countryCode": "BR"
+        }
+        
+        url = f"https://{rapidapi_host}/flights/searchFlights?" + urllib.parse.urlencode(params )
+        
+        headers = {
+            "X-RapidAPI-Key": rapidapi_key,
+            "X-RapidAPI-Host": rapidapi_host
+        }
+
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=20) as response:
             data = json.loads(response.read().decode("utf-8"))
@@ -80,10 +72,8 @@ def get_real_prices(origin_id="CGB", destination_id="OPS"):
         return None
 
 def send_email_notification(prices):
-    if not GMAIL_USER or not GMAIL_PASS:
-        print("❌ Erro: Credenciais de e-mail não configuradas.")
-        return
-
+    email, password = get_email_credentials()
+    
     azul = prices.get('azul', 'N/A') if prices else "Erro API"
     gol = prices.get('gol', 'N/A') if prices else "Erro API"
     
@@ -96,23 +86,21 @@ def send_email_notification(prices):
     )
     
     msg["Subject"] = f"✈️ Preços {datetime.now().strftime('%d/%m %H:%M')}"
-    msg["From"] = GMAIL_USER
-    msg["To"] = GMAIL_USER
+    msg["From"] = email
+    msg["To"] = email
 
     try:
         with smtplib.SMTP("smtp.gmail.com", 587, timeout=10) as server:
             server.starttls()
-            server.login(GMAIL_USER, GMAIL_PASS)
+            server.login(email, password)
             server.send_message(msg)
         print("✅ E-mail enviado com sucesso!")
     except Exception as e:
         print(f"❌ Erro ao enviar e-mail: {e}")
 
 def send_telegram_notification(prices):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("❌ Erro: Credenciais do Telegram não configuradas.")
-        return
-
+    token, chat_id = get_telegram_credentials()
+    
     azul = prices.get('azul', 'N/A') if prices else "Erro API"
     gol = prices.get('gol', 'N/A') if prices else "Erro API"
     
@@ -123,15 +111,15 @@ def send_telegram_notification(prices):
         f"🚀 Dados via API Skyscanner"
     )
     
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": chat_id,
         "text": message,
         "parse_mode": "Markdown"
     }
     
     try:
-        data = json.dumps(payload).encode("utf-8")
+        data = json.dumps(payload ).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
         with urllib.request.urlopen(req, timeout=10) as response:
             print("✅ Telegram enviado com sucesso!")
@@ -148,6 +136,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
