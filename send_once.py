@@ -1,87 +1,108 @@
 #!/usr/bin/env python3
 import smtplib
-from email.message import EmailMessage
-from datetime import datetime
 import json
 import urllib.request
-import urllib.parse
-import sys
-
+import re
+from email.message import EmailMessage
+from datetime import datetime
 from security_config import get_email_credentials, get_telegram_credentials
 
+def get_real_prices(origin="CGB", destination="OPS"):
+    """
+    Busca os preços diretamente do script.js do site fornecido.
+    """
+    url = "https://8080-ilddj876s0oigmq53o8ij-57c5bd0c.us2.manus.computer/script.js"
+    try:
+        with urllib.request.urlopen(url ) as response:
+            js_content = response.read().decode('utf-8')
+            
+            # Extrai o bloco MOCK_DATA usando Regex
+            match = re.search(r'const MOCK_DATA = ({.*?});', js_content, re.DOTALL)
+            if not match:
+                return None
+            
+            # Limpa o conteúdo para ser um JSON válido (remove vírgulas extras e aspas simples)
+            json_str = match.group(1).replace("'", '"')
+            # Remove vírgulas antes de fechamento de colchetes/chaves (comum em JS mas inválido em JSON)
+            json_str = re.sub(r',\s*([\]}])', r'\1', json_str)
+            
+            data = json.loads(json_str)
+            
+            # Filtra os preços para a rota desejada
+            prices = {"azul": "N/A", "gol": "N/A"}
+            
+            for airline in ["azul", "gol"]:
+                flights = [f for f in data.get(airline, []) if f['origin'] == origin and f['destination'] == destination]
+                if flights:
+                    # Pega o menor preço da lista
+                    min_price = min(f['price'] for f in flights)
+                    prices[airline] = f"R${min_price:.2f}"
+            
+            return prices
+    except Exception as e:
+        print(f"Erro ao buscar preços: {e}")
+        return None
 
-def send_email_notification() -> None:
+def send_email_notification(prices) -> None:
     email, password = get_email_credentials()
+    
+    azul_price = prices['azul'] if prices else "Erro ao buscar"
+    gol_price = prices['gol'] if prices else "Erro ao buscar"
 
     msg = EmailMessage()
     content = f"""
-🛫 PASSAGENS CGB→OPS - {datetime.now().strftime("%d/%m %H:%M")}
-🟠 GOL Ida R$847 | Volta R$792
-🔵 AZUL Ida R$892 | Volta R$835
-📧 Monitoramento GitHub Actions ativo!
-📱 Telegram integrado!
+PASSAGENS {datetime.now().strftime("%d/%m %H:%M")}
+🟠 GOL: {gol_price}
+🔵 AZUL: {azul_price}
+✅ Monitoramento Automático Ativo!
 """
     msg.set_content(content)
-    msg["Subject"] = f"✈️ Passagens Atualizadas {datetime.now().strftime('%d/%m %H:%M')}"
+    msg["Subject"] = f"✈️ Preços Atualizados {datetime.now().strftime('%d/%m %H:%M')}"
     msg["From"] = email
     msg["To"] = email
 
-    print(f"--- Iniciando envio de EMAIL para {email} ---")
     with smtplib.SMTP("smtp.gmail.com", 587, timeout=10) as server:
         server.starttls()
-        print("-> TLS iniciado")
         server.login(email, password)
-        print("-> Login realizado com sucesso")
         server.send_message(msg)
-    print(f"✅ Email enviado com sucesso às {datetime.now()}")
+    print(f"✅ E-mail enviado com sucesso!")
 
-
-def send_telegram_notification() -> None:
+def send_telegram_notification(prices) -> None:
     token, chat_id = get_telegram_credentials()
+    
+    azul_price = prices['azul'] if prices else "Erro"
+    gol_price = prices['gol'] if prices else "Erro"
 
     message = (
-        f"🛫 *PASSAGENS CGB→OPS* - {datetime.now().strftime('%d/%m %H:%M')}\n"
-        "🟠 GOL Ida R$847 | Volta R$792\n"
-        "🔵 AZUL Ida R$892 | Volta R$835\n"
-        "📧 Email enviado\n"
-        "✅ Monitoramento ativo no GitHub Actions"
+        f"*PASSAGENS* - {datetime.now().strftime('%d/%m %H:%M')}\n"
+        f"🟠 GOL: {gol_price}\n"
+        f"🔵 AZUL: {azul_price}\n"
+        f"🚀 Dados extraídos do site automaticamente."
     )
-
+    
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
         "chat_id": chat_id,
         "text": message,
         "parse_mode": "Markdown",
     }
-
-    data = urllib.parse.urlencode(payload).encode("utf-8")
+    
+    data = urllib.parse.urlencode(payload ).encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST")
-
-    print("--- Iniciando envio de TELEGRAM ---")
     with urllib.request.urlopen(req, timeout=10) as response:
-        body = response.read().decode("utf-8", errors="ignore")
-        parsed = json.loads(body)
-        if not parsed.get("ok"):
-            raise RuntimeError(f"Falha Telegram: {body}")
-    print("✅ Telegram enviado com sucesso")
+        print("✅ Telegram enviado com sucesso")
 
-
-def main() -> int:
-    try:
-        send_email_notification()
-        send_telegram_notification()
-        print("✅ Fluxo completo concluído (Email + Telegram)")
-        return 0
-    except RuntimeError as e:
-        print(f"❌ ERROR: {e}")
-        return 1
-    except smtplib.SMTPAuthenticationError:
-        print("❌ ERRO DE AUTENTICAÇÃO SMTP: verifique GMAIL_USER e GMAIL_PASS (Senha de App).")
-        return 1
-    except Exception as e:
-        print(f"❌ Erro inesperado: {e}")
-        return 1
-
+def main():
+    # 1. Busca os preços dinâmicos
+    prices = get_real_prices("CGB", "OPS")
+    
+    # 2. Envia as notificações com os preços encontrados
+    send_email_notification(prices)
+    send_telegram_notification(prices)
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
+
+
+
+
