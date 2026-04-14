@@ -16,25 +16,29 @@ def get_real_prices(origin="CGB", destination="OPS"):
         with urllib.request.urlopen(url ) as response:
             js_content = response.read().decode('utf-8')
             
-            # Extrai o bloco MOCK_DATA usando Regex
+            # 1. Extrai o bloco MOCK_DATA usando Regex
             match = re.search(r'const MOCK_DATA = ({.*?});', js_content, re.DOTALL)
             if not match:
                 return None
             
-            # Limpa o conteúdo para ser um JSON válido (remove vírgulas extras e aspas simples)
-            json_str = match.group(1).replace("'", '"')
-            # Remove vírgulas antes de fechamento de colchetes/chaves (comum em JS mas inválido em JSON)
+            json_str = match.group(1)
+            
+            # 2. CORREÇÃO: Adiciona aspas às chaves do JavaScript para tornar o JSON válido
+            # Isso transforma azul: em "azul":, origin: em "origin":, etc.
+            json_str = re.sub(r'(\s)(\w+):', r'\1"\2":', json_str)
+            
+            # 3. Limpa aspas simples e vírgulas extras
+            json_str = json_str.replace("'", '"')
             json_str = re.sub(r',\s*([\]}])', r'\1', json_str)
             
+            # 4. Carrega os dados
             data = json.loads(json_str)
             
-            # Filtra os preços para a rota desejada
+            # 5. Filtra os preços para a rota desejada
             prices = {"azul": "N/A", "gol": "N/A"}
-            
             for airline in ["azul", "gol"]:
                 flights = [f for f in data.get(airline, []) if f['origin'] == origin and f['destination'] == destination]
                 if flights:
-                    # Pega o menor preço da lista
                     min_price = min(f['price'] for f in flights)
                     prices[airline] = f"R${min_price:.2f}"
             
@@ -93,15 +97,17 @@ def send_telegram_notification(prices) -> None:
         print("✅ Telegram enviado com sucesso")
 
 def main():
-    # 1. Busca os preços dinâmicos
+    # Busca os preços para Cuiabá (CGB) -> Operário (OPS)
     prices = get_real_prices("CGB", "OPS")
     
-    # 2. Envia as notificações com os preços encontrados
     send_email_notification(prices)
     send_telegram_notification(prices)
 
 if __name__ == "__main__":
     main()
+
+
+
 
 
 
