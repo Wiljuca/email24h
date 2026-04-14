@@ -16,9 +16,9 @@ def get_entity_id(sky_id, key, host):
     try:
         with urllib.request.urlopen(req, timeout=15) as response:
             data = json.loads(response.read().decode("utf-8"))
-            if data.get("status") and data.get("data"):
+            if isinstance(data, dict) and data.get("status") and data.get("data"):
                 for item in data["data"]:
-                    if item.get("skyId") == sky_id:
+                    if isinstance(item, dict) and item.get("skyId") == sky_id:
                         return item.get("entityId")
                 return data["data"][0].get("entityId")
     except Exception as e:
@@ -42,12 +42,21 @@ def get_prices_for_date(date_str, origin_sky, dest_sky, origin_ent, dest_ent, ke
     
     try:
         with urllib.request.urlopen(req, timeout=25) as response:
-            data = json.loads(response.read().decode("utf-8"))
-            # Trata diferentes formatos de resposta da API
-            if isinstance(data, dict):
+            raw_data = response.read().decode("utf-8")
+            data = json.loads(raw_data)
+            
+            # A API pode retornar uma lista diretamente ou um dicionário com 'data'
+            if isinstance(data, list):
+                return data
+            elif isinstance(data, dict):
+                # Tenta encontrar a lista de itinerários em vários lugares comuns
                 itineraries = data.get("data", {}).get("itineraries", [])
-                if not itineraries and "itineraries" in data:
-                    itineraries = data["itineraries"]
+                if not itineraries:
+                    itineraries = data.get("itineraries", [])
+                if not itineraries:
+                    # Se 'data' for uma lista, retorna ela
+                    if isinstance(data.get("data"), list):
+                        return data["data"]
                 return itineraries
             return []
     except Exception as e:
@@ -67,8 +76,7 @@ def get_best_prices_45_days():
         origin_ent = get_entity_id(origin_sky, key, host) or "95673515"
         dest_ent = get_entity_id(dest_sky, key, host) or "95673516"
 
-        # Reduzimos o número de consultas para garantir que o script termine a tempo
-        # Consultando a cada 5 dias para cobrir os 45 dias de forma rápida
+        # Consultando a cada 5 dias para ser rápido e eficiente
         for i in range(0, 46, 5): 
             current_date = (datetime.now() + timedelta(days=i)).strftime("%Y-%m-%d")
             print(f"🔍 Consultando data: {current_date}...")
@@ -76,44 +84,64 @@ def get_best_prices_45_days():
             itineraries = get_prices_for_date(current_date, origin_sky, dest_sky, origin_ent, dest_ent, key, host)
             
             if not isinstance(itineraries, list):
+                print(f"⚠️ Resposta inesperada para {current_date}, pulando...")
                 continue
 
             for f in itineraries:
                 if not isinstance(f, dict): continue
                 
+                # Extração segura do preço
                 price_data = f.get('price', {})
+                if not isinstance(price_data, dict): continue
+                
                 price_raw = price_data.get('raw', float('inf'))
                 price_fmt = price_data.get('formatted', 'N/A')
                 
+                # Extração segura das companhias aéreas
                 carriers_found = []
                 legs = f.get('legs', [])
-                for leg in legs:
-                    if not isinstance(leg, dict): continue
-                    marketing_carriers = leg.get('carriers', {}).get('marketing', [])
-                    for carrier in marketing_carriers:
-                        if isinstance(carrier, dict):
-                            carriers_found.append(carrier.get('name', '').upper())
+                if isinstance(legs, list):
+                    for leg in legs:
+                        if not isinstance(leg, dict): continue
+                        marketing_carriers = leg.get('carriers', {}).get('marketing', [])
+                        if isinstance(marketing_carriers, list):
+                            for carrier in marketing_carriers:
+                                if isinstance(carrier, dict):
+                                    name = carrier.get('name', '').upper()
+                                    if name: carriers_found.append(name)
 
+                # Se não achou nas legs, tenta no nível superior do itinerário
+                if not carriers_found:
+                    itinerary_carriers = f.get('carriers', [])
+                    if isinstance(itinerary_carriers, list):
+                        for carrier in itinerary_carriers:
+                            if isinstance(carrier, dict):
+                                name = carrier.get('name', '').upper()
+                                if name: carriers_found.append(name)
+                            elif isinstance(carrier, str):
+                                carriers_found.append(carrier.upper())
+
+                # Atualiza os melhores preços
                 for c in carriers_found:
                     if "AZUL" in c and price_raw < best_azul["price"]:
                         best_azul = {"price": price_raw, "formatted": price_fmt, "date": current_date}
                     if "GOL" in c and price_raw < best_gol["price"]:
                         best_gol = {"price": price_raw, "formatted": price_fmt, "date": current_date}
             
-            time.sleep(0.5) # Pausa menor para ser mais rápido
+            time.sleep(0.5)
 
         return best_azul, best_gol
     except Exception as e:
-        print(f"❌ Erro geral na busca: {e}")
+        print(f"❌ Erro crítico na busca: {e}")
         return best_azul, best_gol
 
 def main():
     print("🚀 Iniciando busca de 45 dias...")
     azul, gol = get_best_prices_45_days()
     
-    # Garantir que azul e gol não sejam None antes de acessar
-    if azul is None: azul = {"formatted": "N/A", "date": "N/A"}
-    if gol is None: gol = {"formatted": "N/A", "date": "N/A"}
+    # Fallback final para garantir que as variáveis existam
+    if not azul: azul = {"formatted": "N/A", "date": "N/A"}
+    if not gol: gol = {"formatted": "N/A", "date": "N/A"}
 
     email, password = get_email_credentials()
     token, chat_id = get_telegram_credentials()
@@ -150,6 +178,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
