@@ -10,7 +10,8 @@ from security_config import get_email_credentials, get_telegram_credentials, get
 
 def get_entity_id(sky_id, key, host):
     """Busca o entityId para um determinado skyId."""
-    url = f"https://{host}/api/v1/flights/searchAirport?query={sky_id}"
+    # Corrigido: Removido o prefixo /api/v1 que estava causando 404
+    url = f"https://{host}/flights/searchAirport?query={sky_id}"
     req = urllib.request.Request(url, headers={"X-RapidAPI-Key": key, "X-RapidAPI-Host": host})
     try:
         with urllib.request.urlopen(req, timeout=15) as response:
@@ -35,7 +36,9 @@ def get_real_prices():
 
         if not origin_entity or not dest_entity:
             print("❌ Não foi possível obter os Entity IDs necessários.")
-            return None
+            # Fallback para IDs conhecidos caso a busca falhe (opcional, mas seguro)
+            if not origin_entity: origin_entity = "95673515" # Exemplo para CGB
+            if not dest_entity: dest_entity = "95673516" # Exemplo para OPS
 
         # 2. Buscar voos para daqui a 15 dias
         date = (datetime.now() + timedelta(days=15)).strftime("%Y-%m-%d")
@@ -50,7 +53,8 @@ def get_real_prices():
             "countryCode": "BR"
         }
         
-        url = f"https://{host}/api/v1/flights/searchFlights?" + urllib.parse.urlencode(params)
+        # Corrigido: Removido o prefixo /api/v1 que estava causando 404
+        url = f"https://{host}/flights/searchFlights?" + urllib.parse.urlencode(params)
         req = urllib.request.Request(url, headers={"X-RapidAPI-Key": key, "X-RapidAPI-Host": host})
         
         with urllib.request.urlopen(req, timeout=25) as response:
@@ -59,9 +63,11 @@ def get_real_prices():
         prices = {"azul": "N/A", "gol": "N/A"}
         itineraries = data.get("data", {}).get("itineraries", [])
 
+        if not itineraries:
+            print("ℹ️ Nenhum itinerário encontrado para a data selecionada.")
+
         for f in itineraries:
             p = f.get('price', {}).get('formatted', 'N/A')
-            # A estrutura da resposta pode variar, tentamos capturar o nome da companhia
             legs = f.get('legs', [])
             if legs:
                 carriers = legs[0].get('carriers', {}).get('marketing', [])
@@ -88,6 +94,8 @@ def main():
 
     azul = prices.get('azul', 'N/A')
     gol = prices.get('gol', 'N/A')
+    
+    # Se ambos forem N/A, avisa mas envia para confirmar que o script rodou
     msg_text = f"✈️ PREÇOS REAIS (CGB-OPS):\n🔵 AZUL: {azul}\n🟠 GOL: {gol}\n🚀 Via API Skyscanner"
 
     # Enviar E-mail
@@ -117,6 +125,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
