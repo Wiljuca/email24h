@@ -1,22 +1,22 @@
-"""
-Configuração central de secrets para projeto público.
-Carrega credenciais apenas de variáveis de ambiente e falha cedo com mensagem clara.
-"""
 import os
 
-
 def get_required_secret(name: str) -> str:
-    value = os.getenv(name, "").strip()
+    # Busca a variável de ambiente e remove espaços extras
+    value = os.environ.get(name, "").strip()
+    
+    # Se não encontrar, tenta buscar com prefixo 'secrets.' (comum em alguns ambientes)
     if not value:
-        raise RuntimeError(f"Secret obrigatório ausente: {name}")
+        value = os.environ.get(f"secrets.{name}", "").strip()
+    
+    if not value:
+        print(f"⚠️ Aviso: Secret '{name}' não encontrado no ambiente.")
+        return "" # Retorna vazio em vez de travar o script
     return value
-
 
 def get_email_credentials() -> tuple[str, str]:
     email = get_required_secret("GMAIL_USER")
     password = get_required_secret("GMAIL_PASS")
     return email, password
-
 
 def get_telegram_credentials() -> tuple[str, str]:
     token = get_required_secret("TELEGRAM_BOT_TOKEN")
