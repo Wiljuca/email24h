@@ -43,16 +43,22 @@ def get_prices_for_date(date_str, origin_sky, dest_sky, origin_ent, dest_ent, ke
     try:
         with urllib.request.urlopen(req, timeout=25) as response:
             data = json.loads(response.read().decode("utf-8"))
-            itineraries = data.get("data", {}).get("itineraries", [])
-            if not itineraries and "itineraries" in data:
-                itineraries = data["itineraries"]
-            return itineraries
+            # Trata diferentes formatos de resposta da API
+            if isinstance(data, dict):
+                itineraries = data.get("data", {}).get("itineraries", [])
+                if not itineraries and "itineraries" in data:
+                    itineraries = data["itineraries"]
+                return itineraries
+            return []
     except Exception as e:
         print(f"⚠️ Erro na data {date_str}: {e}")
         return []
 
 def get_best_prices_45_days():
     """Busca os melhores preços da Azul e GOL nos próximos 45 dias."""
+    best_azul = {"price": float('inf'), "formatted": "N/A", "date": "N/A"}
+    best_gol = {"price": float('inf'), "formatted": "N/A", "date": "N/A"}
+    
     try:
         key = get_required_secret("RAPIDAPI_KEY")
         host = "skyscanner-flights-travel-api.p.rapidapi.com"
@@ -61,28 +67,32 @@ def get_best_prices_45_days():
         origin_ent = get_entity_id(origin_sky, key, host) or "95673515"
         dest_ent = get_entity_id(dest_sky, key, host) or "95673516"
 
-        best_azul = {"price": float('inf'), "formatted": "N/A", "date": ""}
-        best_gol = {"price": float('inf'), "formatted": "N/A", "date": ""}
-
-        # Para não estourar o limite da API, vamos testar datas estratégicas
-        # (ex: a cada 3 dias nos próximos 45 dias para cobrir o período sem excesso de chamadas)
-        # Se você tiver limite alto, pode mudar o step para 1.
-        for i in range(0, 46, 3): 
+        # Reduzimos o número de consultas para garantir que o script termine a tempo
+        # Consultando a cada 5 dias para cobrir os 45 dias de forma rápida
+        for i in range(0, 46, 5): 
             current_date = (datetime.now() + timedelta(days=i)).strftime("%Y-%m-%d")
             print(f"🔍 Consultando data: {current_date}...")
             
             itineraries = get_prices_for_date(current_date, origin_sky, dest_sky, origin_ent, dest_ent, key, host)
             
+            if not isinstance(itineraries, list):
+                continue
+
             for f in itineraries:
-                price_raw = f.get('price', {}).get('raw', float('inf'))
-                price_fmt = f.get('price', {}).get('formatted', 'N/A')
+                if not isinstance(f, dict): continue
+                
+                price_data = f.get('price', {})
+                price_raw = price_data.get('raw', float('inf'))
+                price_fmt = price_data.get('formatted', 'N/A')
                 
                 carriers_found = []
                 legs = f.get('legs', [])
                 for leg in legs:
+                    if not isinstance(leg, dict): continue
                     marketing_carriers = leg.get('carriers', {}).get('marketing', [])
                     for carrier in marketing_carriers:
-                        carriers_found.append(carrier.get('name', '').upper())
+                        if isinstance(carrier, dict):
+                            carriers_found.append(carrier.get('name', '').upper())
 
                 for c in carriers_found:
                     if "AZUL" in c and price_raw < best_azul["price"]:
@@ -90,24 +100,27 @@ def get_best_prices_45_days():
                     if "GOL" in c and price_raw < best_gol["price"]:
                         best_gol = {"price": price_raw, "formatted": price_fmt, "date": current_date}
             
-            # Pequena pausa para evitar bloqueio por excesso de requisições
-            time.sleep(1)
+            time.sleep(0.5) # Pausa menor para ser mais rápido
 
         return best_azul, best_gol
     except Exception as e:
-        print(f"❌ Erro geral: {e}")
-        return None, None
+        print(f"❌ Erro geral na busca: {e}")
+        return best_azul, best_gol
 
 def main():
     print("🚀 Iniciando busca de 45 dias...")
     azul, gol = get_best_prices_45_days()
     
+    # Garantir que azul e gol não sejam None antes de acessar
+    if azul is None: azul = {"formatted": "N/A", "date": "N/A"}
+    if gol is None: gol = {"formatted": "N/A", "date": "N/A"}
+
     email, password = get_email_credentials()
     token, chat_id = get_telegram_credentials()
 
     msg_text = "✈️ MELHORES PREÇOS (PRÓXIMOS 45 DIAS):\n\n"
-    msg_text += f"🔵 AZUL: {azul['formatted']} (Data: {azul['date']})\n"
-    msg_text += f"🟠 GOL: {gol['formatted']} (Data: {gol['date']})\n\n"
+    msg_text += f"🔵 AZUL: {azul.get('formatted', 'N/A')} (Data: {azul.get('date', 'N/A')})\n"
+    msg_text += f"🟠 GOL: {gol.get('formatted', 'N/A')} (Data: {gol.get('date', 'N/A')})\n\n"
     msg_text += "🚀 Via API Skyscanner (Busca em intervalo)"
 
     # Enviar E-mail
@@ -137,8 +150,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
 
 
 
