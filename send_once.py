@@ -26,7 +26,7 @@ def get_entity_id(sky_id, key, host):
     return None
 
 def get_prices_for_date(date_str, origin_sky, dest_sky, origin_ent, dest_ent, key, host):
-    """Busca preços para uma data específica."""
+    """Busca preços para uma data específica e mapeia companhias."""
     params = {
         "originSkyId": origin_sky,
         "destinationSkyId": dest_sky,
@@ -45,22 +45,34 @@ def get_prices_for_date(date_str, origin_sky, dest_sky, origin_ent, dest_ent, ke
             raw_data = response.read().decode("utf-8")
             data = json.loads(raw_data)
             
-            # Diagnóstico: Imprime a estrutura se não for o esperado
             if not isinstance(data, dict):
-                print(f"DEBUG: Resposta da data {date_str} não é um dicionário. Tipo: {type(data)}")
-                return data if isinstance(data, list) else []
+                return [], {}
             
+            # Extrai o dicionário de companhias aéreas (carriers) para mapear IDs para Nomes
+            carriers_map = {}
+            carriers_list = data.get("data", {}).get("carriers", [])
+            if not carriers_list:
+                carriers_list = data.get("carriers", [])
+            
+            if isinstance(carriers_list, list):
+                for c in carriers_list:
+                    if isinstance(c, dict):
+                        c_id = str(c.get("id", ""))
+                        c_name = c.get("name", "").upper()
+                        if c_id and c_name:
+                            carriers_map[c_id] = c_name
+
             itineraries = data.get("data", {}).get("itineraries", [])
             if not itineraries:
                 itineraries = data.get("itineraries", [])
             
-            return itineraries
+            return itineraries, carriers_map
     except Exception as e:
         print(f"⚠️ Erro na data {date_str}: {e}")
-        return []
+        return [], {}
 
 def get_best_prices_45_days():
-    """Busca os melhores preços da Azul e GOL nos próximos 45 dias."""
+    """Busca os melhores preços da Azul e GOL nos próximos 45 dias com mapeamento de IDs."""
     best_azul = {"price": float('inf'), "formatted": "N/A", "date": "N/A"}
     best_gol = {"price": float('inf'), "formatted": "N/A", "date": "N/A"}
     
@@ -77,10 +89,9 @@ def get_best_prices_45_days():
             current_date = (datetime.now() + timedelta(days=i)).strftime("%Y-%m-%d")
             print(f"🔍 Consultando data: {current_date}...")
             
-            itineraries = get_prices_for_date(current_date, origin_sky, dest_sky, origin_ent, dest_ent, key, host)
+            itineraries, carriers_map = get_prices_for_date(current_date, origin_sky, dest_sky, origin_ent, dest_ent, key, host)
             
             if not isinstance(itineraries, list):
-                print(f"⚠️ Itinerários para {current_date} não é uma lista. Pulando...")
                 continue
 
             for f in itineraries:
@@ -93,37 +104,40 @@ def get_best_prices_45_days():
                 price_fmt = price_data.get('formatted', 'N/A')
                 
                 carriers_found = []
-                # Tenta capturar o nome da companhia de todas as formas possíveis
+                
+                # Tenta encontrar os IDs das companhias nas legs
                 legs = f.get('legs', [])
                 if isinstance(legs, list):
                     for leg in legs:
                         if not isinstance(leg, dict): continue
-                        marketing_carriers = leg.get('carriers', {}).get('marketing', [])
-                        if isinstance(marketing_carriers, list):
-                            for carrier in marketing_carriers:
-                                if isinstance(carrier, dict):
-                                    name = carrier.get('name', '').upper()
-                                    if name: carriers_found.append(name)
-                
-                # Fallback: Procura por qualquer campo que contenha o nome da companhia
+                        # A API pode usar 'carrierIds' ou 'carriers' -> 'marketing'
+                        carrier_ids = leg.get('carrierIds', [])
+                        if not carrier_ids:
+                            marketing = leg.get('carriers', {}).get('marketing', [])
+                            for m in marketing:
+                                if isinstance(m, dict):
+                                    c_id = str(m.get('id', ''))
+                                    if c_id in carriers_map:
+                                        carriers_found.append(carriers_map[c_id])
+                                    elif m.get('name'):
+                                        carriers_found.append(m.get('name').upper())
+                        else:
+                            for cid in carrier_ids:
+                                cid_str = str(cid)
+                                if cid_str in carriers_map:
+                                    carriers_found.append(carriers_map[cid_str])
+
+                # Fallback: Se não achou nas legs, tenta no nível superior
                 if not carriers_found:
-                    for key_name in ['carriers', 'carrier', 'airline']:
-                        val = f.get(key_name)
-                        if isinstance(val, list):
-                            for v in val:
-                                if isinstance(v, dict): carriers_found.append(v.get('name', '').upper())
-                                elif isinstance(v, str): carriers_found.append(v.upper())
-                        elif isinstance(val, dict):
-                            carriers_found.append(val.get('name', '').upper())
-                        elif isinstance(val, str):
-                            carriers_found.append(val.upper())
+                    itinerary_carrier_ids = f.get('carrierIds', [])
+                    if isinstance(itinerary_carrier_ids, list):
+                        for cid in itinerary_carrier_ids:
+                            cid_str = str(cid)
+                            if cid_str in carriers_map:
+                                carriers_found.append(carriers_map[cid_str])
 
-                # Diagnóstico: Se achou voo mas não a companhia, avisa no log
-                if not carriers_found and price_raw != float('inf'):
-                    print(f"DEBUG: Voo encontrado em {current_date} por {price_fmt}, mas companhia não identificada.")
-
+                # Atualiza os melhores preços
                 for c in carriers_found:
-                    # Filtro flexível: basta conter o nome
                     if "AZUL" in c and price_raw < best_azul["price"]:
                         best_azul = {"price": price_raw, "formatted": price_fmt, "date": current_date}
                     if "GOL" in c and price_raw < best_gol["price"]:
@@ -137,7 +151,7 @@ def get_best_prices_45_days():
         return best_azul, best_gol
 
 def main():
-    print("🚀 Iniciando busca de 45 dias...")
+    print("🚀 Iniciando busca de 45 dias com mapeamento de IDs...")
     azul, gol = get_best_prices_45_days()
     
     email, password = get_email_credentials()
@@ -146,7 +160,7 @@ def main():
     msg_text = "✈️ MELHORES PREÇOS (PRÓXIMOS 45 DIAS):\n\n"
     msg_text += f"🔵 AZUL: {azul.get('formatted', 'N/A')} (Data: {azul.get('date', 'N/A')})\n"
     msg_text += f"🟠 GOL: {gol.get('formatted', 'N/A')} (Data: {gol.get('date', 'N/A')})\n\n"
-    msg_text += "🚀 Via API Skyscanner (Busca em intervalo)"
+    msg_text += "🚀 Via API Skyscanner (Mapeamento de IDs)"
 
     # Enviar E-mail
     try:
