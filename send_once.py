@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 import os
 import sys
 import json
@@ -8,9 +7,12 @@ import urllib.parse
 import urllib.error
 import time
 import logging
+import smtplib
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Optional, Tuple
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 import hashlib
 
 # ============================================
@@ -32,7 +34,7 @@ logger = logging.getLogger(__name__)
 # ============================================
 
 DUFFEL_API_BASE = "https://api.duffel.com/air"
-DUFFEL_VERSION = "2021-10-25"  # ✅ Versão correta
+DUFFEL_VERSION = "2024-12-01"  # ✅ VERSÃO CORRIGIDA
 ORIGIN = "CGB"
 DESTINATION = "OPS"
 SEARCH_DAYS = 45
@@ -128,7 +130,7 @@ class DuffelClient:
             "Authorization": f"Bearer {self.token}",
             "Duffel-Version": DUFFEL_VERSION,
             "Content-Type": "application/json",
-            "User-Agent": "DuffelMonitor/v18"
+            "User-Agent": "DuffelMonitor/v19"
         }
         
         data = json.dumps(body).encode("utf-8") if body else None
@@ -264,6 +266,112 @@ def search_prices(client: DuffelClient) -> Tuple[Dict, Dict]:
     return best_azul, best_gol
 
 # ============================================
+# FUNÇÕES DE NOTIFICAÇÃO
+# ============================================
+
+def send_email(azul: Dict, gol: Dict) -> bool:
+    """Envia email com os preços encontrados."""
+    try:
+        email = os.getenv("GMAIL_USER")
+        password = os.getenv("GMAIL_PASS")
+        
+        if not email or not password:
+            logger.error("❌ GMAIL_USER ou GMAIL_PASS não configurados")
+            return False
+        
+        # Preparar mensagem
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = f"✈️ Alerta Duffel - {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+        msg["From"] = email
+        msg["To"] = email
+        
+        # Conteúdo HTML
+        html = f"""
+        <html>
+            <body style="font-family: Arial, sans-serif;">
+                <h2>✈️ MELHORES PREÇOS - DUFFEL EDITION (v19)</h2>
+                <p><strong>Rota:</strong> {ORIGIN} → {DESTINATION}</p>
+                <hr>
+                <h3>🔵 AZUL</h3>
+                <p><strong>Preço:</strong> {azul['formatted']}</p>
+                <p><strong>Data:</strong> {azul['date']}</p>
+                <hr>
+                <h3>🟠 GOL</h3>
+                <p><strong>Preço:</strong> {gol['formatted']}</p>
+                <p><strong>Data:</strong> {gol['date']}</p>
+                <hr>
+                <p><small>Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}</small></p>
+            </body>
+        </html>
+        """
+        
+        msg.attach(MIMEText(html, "html"))
+        
+        # Enviar email
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.starttls()
+            server.login(email, password)
+            server.send_message(msg)
+        
+        logger.info("✅ Email enviado com sucesso!")
+        return True
+    
+    except Exception as e:
+        logger.error(f"❌ Erro ao enviar email: {e}")
+        return False
+
+def send_telegram(azul: Dict, gol: Dict) -> bool:
+    """Envia mensagem Telegram com os preços encontrados."""
+    try:
+        token = os.getenv("TELEGRAM_BOT_TOKEN")
+        chat_id = os.getenv("TELEGRAM_CHAT_ID")
+        
+        if not token or not chat_id:
+            logger.error("❌ TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID não configurados")
+            return False
+        
+        # Preparar mensagem
+        msg_text = f"""✈️ MELHORES PREÇOS - DUFFEL EDITION (v19)
+
+🔵 AZUL: {azul['formatted']}
+📅 Data: {azul['date']}
+
+🟠 GOL: {gol['formatted']}
+📅 Data: {gol['date']}
+
+Rota: {ORIGIN} → {DESTINATION}
+⏰ {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"""
+        
+        # Enviar via Telegram
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = json.dumps({
+            "chat_id": chat_id,
+            "text": msg_text,
+            "parse_mode": "Markdown"
+        } ).encode("utf-8")
+        
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        
+        with urllib.request.urlopen(req, timeout=10) as response:
+            result = json.loads(response.read().decode("utf-8"))
+            
+            if result.get("ok"):
+                logger.info("✅ Telegram enviado com sucesso!")
+                return True
+            else:
+                logger.error(f"❌ Erro Telegram: {result.get('description', 'Desconhecido')}")
+                return False
+    
+    except Exception as e:
+        logger.error(f"❌ Erro ao enviar Telegram: {e}")
+        return False
+
+# ============================================
 # FUNÇÃO PRINCIPAL
 # ============================================
 
@@ -271,7 +379,7 @@ def main():
     """Função principal do script."""
     
     logger.info("=" * 60)
-    logger.info("🚀 Script v18 - Duffel Edition (Otimizado)")
+    logger.info("🚀 Script v19 - Duffel Edition (CORRIGIDO)")
     logger.info("=" * 60)
     
     # Obter token
@@ -291,7 +399,7 @@ def main():
         sys.exit(1)
     
     # Preparar mensagem
-    msg_text = "✈️ MELHORES PREÇOS - DUFFEL EDITION (v18 Otimizado):\n\n"
+    msg_text = "✈️ MELHORES PREÇOS - DUFFEL EDITION (v19 Corrigido):\n\n"
     msg_text += f"🔵 AZUL: {azul['formatted']} (Data: {azul['date']})\n"
     msg_text += f"🟠 GOL: {gol['formatted']} (Data: {gol['date']})\n\n"
     msg_text += f"Rota: {ORIGIN} → {DESTINATION}\n"
@@ -318,13 +426,22 @@ def main():
     except Exception as e:
         logger.error(f"❌ Erro ao salvar resultado: {e}")
     
+    # Enviar notificações
+    logger.info("\n📤 Enviando notificações...")
+    email_sent = send_email(azul, gol)
+    telegram_sent = send_telegram(azul, gol)
+    
+    if email_sent or telegram_sent:
+        logger.info("✅ Notificações enviadas com sucesso!")
+    else:
+        logger.warning("⚠️ Falha ao enviar notificações")
+    
     logger.info("=" * 60)
     logger.info("✅ Script finalizado com sucesso!")
     logger.info("=" * 60)
 
 if __name__ == "__main__":
     main()
-
 
 
 
