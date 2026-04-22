@@ -16,7 +16,7 @@ from email.mime.multipart import MIMEMultipart
 import hashlib
 
 # ============================================
-# LOGGING SEGURO
+# LOGGING
 # ============================================
 
 logging.basicConfig(
@@ -31,7 +31,8 @@ logger = logging.getLogger(__name__)
 # ============================================
 
 DUFFEL_API_BASE = "https://api.duffel.com/air"
-DUFFEL_VERSION = "2025-02-17"
+# Tentamos estas versões em ordem até uma funcionar
+DUFFEL_VERSIONS_TO_TRY = ["2025-02-17", "v2", "2024-12-01"]
 ORIGIN = "CGB"
 DESTINATION = "OPS"
 SEARCH_START_DAY = 1
@@ -52,13 +53,13 @@ CACHE_DIR.mkdir(exist_ok=True)
 
 class DuffelCache:
     @staticmethod
-    def get_cache_key(endpoint: str, params: Dict) -> str:
-        key_str = f"{endpoint}:{json.dumps(params, sort_keys=True)}"
+    def get_cache_key(endpoint: str, params: Dict, version: str) -> str:
+        key_str = f"{version}:{endpoint}:{json.dumps(params, sort_keys=True)}"
         return hashlib.md5(key_str.encode()).hexdigest()
 
     @staticmethod
-    def get(endpoint: str, params: Dict) -> Optional[Dict]:
-        cache_key = DuffelCache.get_cache_key(endpoint, params)
+    def get(endpoint: str, params: Dict, version: str) -> Optional[Dict]:
+        cache_key = DuffelCache.get_cache_key(endpoint, params, version)
         cache_file = CACHE_DIR / f"{cache_key}.json"
         if not cache_file.exists():
             return None
@@ -73,8 +74,8 @@ class DuffelCache:
             return None
 
     @staticmethod
-    def set(endpoint: str, params: Dict, data: Dict) -> None:
-        cache_key = DuffelCache.get_cache_key(endpoint, params)
+    def set(endpoint: str, params: Dict, version: str, data: Dict) -> None:
+        cache_key = DuffelCache.get_cache_key(endpoint, params, version)
         cache_file = CACHE_DIR / f"{cache_key}.json"
         try:
             with open(cache_file, 'w') as f:
@@ -83,28 +84,28 @@ class DuffelCache:
             pass
 
 # ============================================
-# CLIENTE DUFFEL
+# CLIENTE COM FALLBACK DE VERSÃO
 # ============================================
 
 class DuffelClient:
     def __init__(self, token: str):
         self.token = token
+        self.working_version = None
 
-    def call_api(self, endpoint: str, method: str = "GET", body: Optional[Dict] = None,
-                 retry_count: int = 0) -> Optional[Dict]:
-
+    def _try_version(self, version: str, endpoint: str, method: str, body: Optional[Dict]) -> Tuple[Optional[Dict], Optional[str]]:
+        """Tenta uma versão específica. Retorna (response, error_reason)"""
         cache_key = {"endpoint": endpoint, "method": method, "body": body}
-        cached_response = DuffelCache.get(endpoint, cache_key)
+        cached_response = DuffelCache.get(endpoint, cache_key, version)
         if cached_response:
-            logger.info(f"CACHE_HIT endpoint={endpoint}")
-            return cached_response
+            logger.info(f"CACHE_HIT endpoint={endpoint} version={version}")
+            return cached_response, None
 
         url = f"{DUFFEL_API_BASE}/{endpoint}"
         headers = {
             "Authorization": f"Bearer {self.token}",
-            "Duffel-Version": DUFFEL_VERSION,
+            "Duffel-Version": version,
             "Content-Type": "application/json",
-            "User-Agent": "DuffelMonitor/v20.3"
+            "User-Agent": "DuffelMonitor/v20.4"
         }
         data = json.dumps(body).encode("utf-8") if body else None
 
@@ -112,9 +113,10 @@ class DuffelClient:
             req = urllib.request.Request(url, data=data, headers=headers, method=method)
             with urllib.request.urlopen(req, timeout=30) as response:
                 response_data = json.loads(response.read().decode("utf-8"))
-                DuffelCache.set(endpoint, cache_key, response_data)
-                logger.info(f"API_OK method={method} endpoint={endpoint} status={response.status}")
-                return response_data
+                DuffelCache.set(endpoint, cache_key, version, response_data)
+                logger.info(f"API_OK method={method} endpoint={endpoint} status={response.status} version={version}")
+                self.working_version = version
+                return response_data, None
 
         except urllib.error.HTTPError as e:
             err_type = "unknown"
@@ -126,31 +128,52 @@ class DuffelClient:
                 err_obj = error_json.get('errors', [{}])[0]
                 err_type = err_obj.get('type', 'unknown')
                 err_title = err_obj.get('title', '')
-                # Sanitiza o detail: pega só os primeiros 80 chars e remove possíveis IDs
                 detail_raw = err_obj.get('detail', '')
                 if detail_raw:
                     err_detail = detail_raw[:80].replace('req_', 'req_***').replace('orq_', 'orq_***')
             except Exception:
                 pass
-            logger.error(f"API_ERR method={method} endpoint={endpoint} status={e.code} type={err_type} title={err_title} detail={err_detail}")
 
-            if (e.code >= 500 or e.code == 429) and retry_count < MAX_RETRIES:
-                wait_time = RETRY_DELAY * (2 ** retry_count)
-                logger.info(f"RETRY attempt={retry_count + 1}/{MAX_RETRIES} wait={wait_time}s")
-                time.sleep(wait_time)
-                return self.call_api(endpoint, method, body, retry_count + 1)
-            return None
+            if err_title == "Unsupported version":
+                return None, "unsupported_version"
+
+            logger.error(f"API_ERR method={method} endpoint={endpoint} status={e.code} type={err_type} title={err_title} detail={err_detail} version={version}")
+            return None, f"{err_type}:{err_title}"
 
         except Exception as e:
-            logger.error(f"API_EXC method={method} endpoint={endpoint} exc={type(e).__name__}")
-            if retry_count < MAX_RETRIES:
-                wait_time = RETRY_DELAY * (2 ** retry_count)
-                time.sleep(wait_time)
-                return self.call_api(endpoint, method, body, retry_count + 1)
-            return None
+            logger.error(f"API_EXC method={method} endpoint={endpoint} exc={type(e).__name__} version={version}")
+            return None, "exception"
+
+    def call_api(self, endpoint: str, method: str = "GET", body: Optional[Dict] = None,
+                 retry_count: int = 0) -> Optional[Dict]:
+
+        # Se já descobrimos uma versão que funciona, usa ela direto
+        versions_to_try = [self.working_version] if self.working_version else DUFFEL_VERSIONS_TO_TRY
+
+        for version in versions_to_try:
+            if not version:
+                continue
+            response, err = self._try_version(version, endpoint, method, body)
+            if response:
+                return response
+            if err == "unsupported_version":
+                logger.warning(f"VERSION_SKIP version={version} reason=unsupported")
+                continue
+            else:
+                # Se não é erro de versão, não adianta tentar outra
+                break
+
+        # Retry só para 5xx
+        if retry_count < MAX_RETRIES:
+            wait_time = RETRY_DELAY * (2 ** retry_count)
+            logger.info(f"RETRY attempt={retry_count + 1}/{MAX_RETRIES} wait={wait_time}s")
+            time.sleep(wait_time)
+            return self.call_api(endpoint, method, body, retry_count + 1)
+
+        return None
 
 # ============================================
-# BUSCA - PAYLOAD MÍNIMO VÁLIDO PARA 2025-02-17
+# BUSCA
 # ============================================
 
 def search_prices(client: DuffelClient) -> Tuple[Dict, Dict]:
@@ -167,7 +190,6 @@ def search_prices(client: DuffelClient) -> Tuple[Dict, Dict]:
         dates_checked += 1
         logger.info(f"SEARCH_DATE date={target_date} step={dates_checked}")
 
-        # PAYLOAD MÍNIMO: sem cabin_class, sem nada opcional
         search_body = {
             "data": {
                 "slices": [{
@@ -225,7 +247,7 @@ def search_prices(client: DuffelClient) -> Tuple[Dict, Dict]:
                 continue
         time.sleep(0.5)
 
-    logger.info(f"SEARCH_END total_offers={total_offers} zero_offers_requests={zero_offers_requests} dates_checked={dates_checked}")
+    logger.info(f"SEARCH_END total_offers={total_offers} zero_offers_requests={zero_offers_requests} dates_checked={dates_checked} version_used={client.working_version}")
     if total_offers == 0:
         logger.error("SEARCH_FAIL reason=no_inventory_or_test_token")
     return best_azul, best_gol
@@ -249,11 +271,11 @@ def send_email(azul: Dict, gol: Dict) -> bool:
 
         html = f"""
         <html><body style="font-family: Arial, sans-serif;">
-        <h2>✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.3)</h2>
+        <h2>✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.4)</h2>
         <p><strong>Rota:</strong> {ORIGIN} → {DESTINATION}</p>
         <p><strong>Janela:</strong> D+{SEARCH_START_DAY} até D+{SEARCH_END_DAY}, a cada {INTERVAL_DAYS} dias</p><hr>
-        <h3>🔵 AZUL</h3><p><strong>Preço:</strong> {azul['formatted']}</p><p><strong>Data:</strong> {azul['date']}</p><hr>
-        <h3>🟠 GOL</h3><p><strong>Preço:</strong> {gol['formatted']}</p><strong>Data:</strong> {gol['date']}</p><hr>
+        <h3>🔵 AZUL</h3><p><strong>Preço:</strong> {azul['formatted']}</p><strong>Data:</strong> {azul['date']}</p><hr>
+        <h3>🟠 GOL</h3><p><strong>Preço:</strong> {gol['formatted']}</p><p><strong>Data:</strong> {gol['date']}</p><hr>
         <p><small>Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}</small></p>
         </body></html>
         """
@@ -276,7 +298,7 @@ def send_telegram(azul: Dict, gol: Dict) -> bool:
             logger.error("TELEGRAM_SKIP reason=missing_env")
             return False
 
-        msg_text = f"""✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.3)
+        msg_text = f"""✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.4)
 
 🔵 AZUL: {azul['formatted']}
 📅 Data: {azul['date']}
@@ -308,7 +330,7 @@ Janela: D+{SEARCH_START_DAY} a D+{SEARCH_END_DAY} / {INTERVAL_DAYS} em {INTERVAL
 
 def main():
     logger.info("=" * 60)
-    logger.info("🚀 Script v20.3 - Duffel Edition SEGURA")
+    logger.info("🚀 Script v20.4 - Duffel Edition SEGURA")
     logger.info("=" * 60)
 
     token = os.getenv("DUFFEL_ACCESS_TOKEN")
@@ -323,10 +345,10 @@ def main():
         logger.error(f"SEARCH_EXC exc={type(e).__name__}")
         sys.exit(1)
 
-    msg_text = f"✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.3):\n\n🔵 AZUL: {azul['formatted']} (Data: {azul['date']})\n🟠 GOL: {gol['formatted']} (Data: {gol['date']})\n\nRota: {ORIGIN} → {DESTINATION}\nJanela: D+{SEARCH_START_DAY} a D+{SEARCH_END_DAY} / {INTERVAL_DAYS}d\nVersão API: {DUFFEL_VERSION}\nGerado: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
+    msg_text = f"✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.4):\n\n🔵 AZUL: {azul['formatted']} (Data: {azul['date']})\n🟠 GOL: {gol['formatted']} (Data: {gol['date']})\n\nRota: {ORIGIN} → {DESTINATION}\nJanela: D+{SEARCH_START_DAY} a D+{SEARCH_END_DAY} / {INTERVAL_DAYS}d\nVersão API usada: {client.working_version}\nGerado: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
     logger.info("\n" + msg_text)
 
-    result = {"timestamp": datetime.now().isoformat(), "origin": ORIGIN, "destination": DESTINATION, "azul": azul, "gol": gol}
+    result = {"timestamp": datetime.now().isoformat(), "origin": ORIGIN, "destination": DESTINATION, "azul": azul, "gol": gol, "version": client.working_version}
     try:
         with open("/tmp/duffel_result.json", 'w') as f:
             json.dump(result, f, indent=2)
