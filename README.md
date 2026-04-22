@@ -28,3 +28,7 @@ Zero dependência externa. Não precisa instalar nada.
 
 1. **Fork** este repositório
 2. **Adicione os Secrets** em `Settings > Secrets and variables > Actions`:
+
+### Observação
+
+1. Este projeto é educacional. Respeite os Termos de Uso da Duffel.
