@@ -16,13 +16,13 @@ from email.mime.multipart import MIMEMultipart
 import hashlib
 
 # ============================================
-# CONFIGURAÇÃO DE LOGGING - 100% SEGURO
+# LOGGING SEGURO
 # ============================================
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)] # Sem FileHandler = não vaza em artifact
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
 
@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 # ============================================
 
 DUFFEL_API_BASE = "https://api.duffel.com/air"
-DUFFEL_VERSION = "2025-02-17" # ✅ Versão atual em 22/04/2026. Atualizar se Duffel avisar
+DUFFEL_VERSION = "2025-02-17" # Versão atual. Duffel muda a cada 2-3 meses
 ORIGIN = "CGB"
 DESTINATION = "OPS"
 SEARCH_DAYS = 45
@@ -46,7 +46,7 @@ POLLING_DELAY = 1.5
 CACHE_DIR.mkdir(exist_ok=True)
 
 # ============================================
-# CLASSE DE CACHE
+# CACHE
 # ============================================
 
 class DuffelCache:
@@ -82,7 +82,7 @@ class DuffelCache:
             pass
 
 # ============================================
-# CLIENTE DUFFEL COM LOGS SANITIZADOS
+# CLIENTE DUFFEL
 # ============================================
 
 class DuffelClient:
@@ -103,7 +103,7 @@ class DuffelClient:
             "Authorization": f"Bearer {self.token}",
             "Duffel-Version": DUFFEL_VERSION,
             "Content-Type": "application/json",
-            "User-Agent": "DuffelMonitor/v20"
+            "User-Agent": "DuffelMonitor/v20.1"
         }
         data = json.dumps(body).encode("utf-8") if body else None
 
@@ -117,13 +117,17 @@ class DuffelClient:
 
         except urllib.error.HTTPError as e:
             err_type = "unknown"
+            err_title = ""
             try:
                 error_body = e.read().decode("utf-8")
                 error_json = json.loads(error_body)
-                err_type = error_json.get('errors', [{}])[0].get('type', 'unknown')
+                err_obj = error_json.get('errors', [{}])[0]
+                err_type = err_obj.get('type', 'unknown')
+                # Logamos só o title, nunca detail/request_id/meta
+                err_title = err_obj.get('title', '')
             except Exception:
                 pass
-            logger.error(f"API_ERR method={method} endpoint={endpoint} status={e.code} type={err_type}")
+            logger.error(f"API_ERR method={method} endpoint={endpoint} status={e.code} type={err_type} title={err_title}")
 
             if (e.code >= 500 or e.code == 429) and retry_count < MAX_RETRIES:
                 wait_time = RETRY_DELAY * (2 ** retry_count)
@@ -141,7 +145,7 @@ class DuffelClient:
             return None
 
 # ============================================
-# BUSCA COM POLLING CORRETO
+# BUSCA COM SCHEMA CORRETO DA VERSÃO 2025-02-17
 # ============================================
 
 def search_prices(client: DuffelClient) -> Tuple[Dict, Dict]:
@@ -156,15 +160,19 @@ def search_prices(client: DuffelClient) -> Tuple[Dict, Dict]:
         target_date = (datetime.now() + timedelta(days=i)).strftime("%Y-%m-%d")
         logger.info(f"SEARCH_DATE date={target_date}")
 
+        # CORREÇÃO: cabin_class agora vai dentro do slice
         search_body = {
             "data": {
-                "slices": [{"origin": ORIGIN, "destination": DESTINATION, "departure_date": target_date}],
-                "passengers": [{"type": "adult"}],
-                "cabin_class": "economy"
+                "slices": [{
+                    "origin": ORIGIN,
+                    "destination": DESTINATION,
+                    "departure_date": target_date,
+                    "cabin_class": "economy" # <-- MUDOU AQUI
+                }],
+                "passengers": [{"type": "adult"}]
             }
         }
 
-        # 1. Criar Offer Request
         response = client.call_api("offer_requests", method="POST", body=search_body)
         if not response or "data" not in response:
             logger.warning(f"SEARCH_SKIP date={target_date} reason=no_offer_request")
@@ -172,7 +180,6 @@ def search_prices(client: DuffelClient) -> Tuple[Dict, Dict]:
 
         offer_request_id = response["data"]["id"]
 
-        # 2. Polling das Offers - obrigatório na Duffel
         offers = []
         for attempt in range(POLLING_ATTEMPTS):
             if attempt > 0:
@@ -236,7 +243,7 @@ def send_email(azul: Dict, gol: Dict) -> bool:
 
         html = f"""
         <html><body style="font-family: Arial, sans-serif;">
-        <h2>✈️ MELHORES PREÇOS - DUFFEL EDITION (v20)</h2>
+        <h2>✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.1)</h2>
         <p><strong>Rota:</strong> {ORIGIN} → {DESTINATION}</p><hr>
         <h3>🔵 AZUL</h3><p><strong>Preço:</strong> {azul['formatted']}</p><p><strong>Data:</strong> {azul['date']}</p><hr>
         <h3>🟠 GOL</h3><p><strong>Preço:</strong> {gol['formatted']}</p><p><strong>Data:</strong> {gol['date']}</p><hr>
@@ -262,7 +269,7 @@ def send_telegram(azul: Dict, gol: Dict) -> bool:
             logger.error("TELEGRAM_SKIP reason=missing_env")
             return False
 
-        msg_text = f"""✈️ MELHORES PREÇOS - DUFFEL EDITION (v20)
+        msg_text = f"""✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.1)
 
 🔵 AZUL: {azul['formatted']}
 📅 Data: {azul['date']}
@@ -293,7 +300,7 @@ Rota: {ORIGIN} → {DESTINATION}
 
 def main():
     logger.info("=" * 60)
-    logger.info("🚀 Script v20 - Duffel Edition SEGURA")
+    logger.info("🚀 Script v20.1 - Duffel Edition SEGURA")
     logger.info("=" * 60)
 
     token = os.getenv("DUFFEL_ACCESS_TOKEN")
@@ -308,7 +315,7 @@ def main():
         logger.error(f"SEARCH_EXC exc={type(e).__name__}")
         sys.exit(1)
 
-    msg_text = f"✈️ MELHORES PREÇOS - DUFFEL EDITION (v20):\n\n🔵 AZUL: {azul['formatted']} (Data: {azul['date']})\n🟠 GOL: {gol['formatted']} (Data: {gol['date']})\n\nRota: {ORIGIN} → {DESTINATION}\nVersão API: {DUFFEL_VERSION}\nGerado: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
+    msg_text = f"✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.1):\n\n🔵 AZUL: {azul['formatted']} (Data: {azul['date']})\n🟠 GOL: {gol['formatted']} (Data: {gol['date']})\n\nRota: {ORIGIN} → {DESTINATION}\nVersão API: {DUFFEL_VERSION}\nGerado: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
     logger.info("\n" + msg_text)
 
     result = {"timestamp": datetime.now().isoformat(), "origin": ORIGIN, "destination": DESTINATION, "azul": azul, "gol": gol}
