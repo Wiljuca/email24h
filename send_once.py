@@ -44,12 +44,13 @@ CACHE_EXPIRY = 3600
 POLLING_ATTEMPTS = 4
 POLLING_DELAY = 1.5
 CURRENCY_CACHE = {}
+# Só usado se BCB + BCE falharem. Atualize 1x por trimestre se quiser
 EMERGENCY_RATES = {"EUR": 6.15, "USD": 5.70, "GBP": 7.20}
 
 CACHE_DIR.mkdir(exist_ok=True)
 
 # ============================================
-# COTAÇÃO COM 3 FALLBACKS + LOG DETALHADO
+# COTAÇÃO BCB + BCE - 100% AUTOMÁTICA
 # ============================================
 
 def get_exchange_rate(from_currency: str, to_currency: str = "BRL") -> Optional[float]:
@@ -60,45 +61,49 @@ def get_exchange_rate(from_currency: str, to_currency: str = "BRL") -> Optional[
     if cache_key in CURRENCY_CACHE:
         return CURRENCY_CACHE[cache_key]
 
-    apis = [
-        {"name": "frankfurter", "url": f"https://api.frankfurter.app/latest?from={from_currency}&to={to_currency}"},
-        {"name": "exchangerate.host", "url": f"https://api.exchangerate.host/convert?from={from_currency}&to={to_currency}&amount=1"},
-        {"name": "er-api", "url": f"https://open.er-api.com/v6/latest/{from_currency}"}
-    ]
-
-    for api in apis:
+    # API 1: Banco Central do Brasil - PTAX. Gratuita, oficial, só tem USD
+    # Se pedir EUR, convertemos USD->EUR depois via frankfurter
+    if from_currency == "USD":
         try:
-            req = urllib.request.Request(api["url"], headers={"User-Agent": "DuffelMonitor/v20.9"})
+            # Pega cotação de D-1 porque D-0 só sai 13h
+            date_bcb = (datetime.now() - timedelta(days=1)).strftime("%m-%d-%Y")
+            url = f"https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata/CotacaoDolarDia(dataCotacao=@dataCotacao)?@dataCotacao='{date_bcb}'&$format=json&$select=cotacaoCompra"
+            req = urllib.request.Request(url, headers={"User-Agent": "DuffelMonitor/v20.10"})
             with urllib.request.urlopen(req, timeout=8) as response:
-                raw = response.read().decode("utf-8")
-                if not raw.startswith("{"):
-                    logger.warning(f"CURRENCY_BAD_RESP source={api['name']} body={raw[:100]}")
-                    continue
-
-                data = json.loads(raw)
-                rate = None
-
-                if api["name"] == "frankfurter" and "rates" in data:
-                    rate = data["rates"].get(to_currency)
-                elif api["name"] == "exchangerate.host" and "result" in data:
-                    rate = data["result"]
-                elif api["name"] == "er-api" and "rates" in data:
-                    rate = data["rates"].get(to_currency)
-
-                if rate:
-                    rate = float(rate)
+                data = json.loads(response.read().decode("utf-8"))
+                if data.get("value") and len(data["value"]) > 0:
+                    rate = float(data["value"][0]["cotacaoCompra"])
                     CURRENCY_CACHE[cache_key] = rate
-                    logger.info(f"CURRENCY_RATE from={from_currency} to={to_currency} rate={rate:.4f} source={api['name']}")
+                    logger.info(f"CURRENCY_RATE from=USD to=BRL rate={rate:.4f} source=BCB-PTAX")
                     return rate
-                else:
-                    logger.warning(f"CURRENCY_NO_RATE source={api['name']} keys={list(data.keys())}")
-
-        except urllib.error.HTTPError as e:
-            logger.warning(f"CURRENCY_HTTP_ERR source={api['name']} status={e.code}")
         except Exception as e:
-            logger.warning(f"CURRENCY_EXC source={api['name']} exc={type(e).__name__} msg={str(e)[:50]}")
-        continue
+            logger.warning(f"CURRENCY_BCB_ERR exc={type(e).__name__}")
 
+    # API 2: Banco Central Europeu via frankfurter.app. Atualiza todo dia 16h CET
+    try:
+        url = f"https://api.frankfurter.app/latest?from={from_currency}&to={to_currency}"
+        req = urllib.request.Request(url, headers={"User-Agent": "DuffelMonitor/v20.10"})
+        with urllib.request.urlopen(req, timeout=8) as response:
+            data = json.loads(response.read().decode("utf-8"))
+            if "rates" in data and to_currency in data["rates"]:
+                rate = float(data["rates"][to_currency])
+                CURRENCY_CACHE[cache_key] = rate
+                logger.info(f"CURRENCY_RATE from={from_currency} to={to_currency} rate={rate:.4f} source=frankfurter")
+                return rate
+    except Exception as e:
+        logger.warning(f"CURRENCY_FRANK_ERR exc={type(e).__name__}")
+
+    # API 3: Fallback via USD se pedir EUR e BCB funcionou
+    if from_currency == "EUR" and to_currency == "BRL":
+        usd_brl = get_exchange_rate("USD", "BRL")
+        eur_usd = get_exchange_rate("EUR", "USD")
+        if usd_brl and eur_usd:
+            rate = eur_usd * usd_brl
+            CURRENCY_CACHE[cache_key] = rate
+            logger.info(f"CURRENCY_RATE from=EUR to=BRL rate={rate:.4f} source=cross-EURUSD")
+            return rate
+
+    # API 4: Emergência fixa
     if from_currency in EMERGENCY_RATES:
         rate = EMERGENCY_RATES[from_currency]
         logger.error(f"CURRENCY_EMERGENCY from={from_currency} to={to_currency} rate={rate:.4f}")
@@ -176,7 +181,7 @@ class DuffelClient:
             "Authorization": f"Bearer {self.token}",
             "Duffel-Version": version,
             "Content-Type": "application/json",
-            "User-Agent": "DuffelMonitor/v20.9"
+            "User-Agent": "DuffelMonitor/v20.10"
         }
         data = json.dumps(body).encode("utf-8") if body else None
 
@@ -240,12 +245,12 @@ class DuffelClient:
         return None
 
 # ============================================
-# BUSCA COM CONVERSÃO - LINHA CORRIGIDA AQUI
+# BUSCA COM CONVERSÃO - COMPARA POR BRL
 # ============================================
 
 def search_prices(client: DuffelClient) -> Tuple[Dict, Dict]:
-    best_azul = {"price": float('inf'), "formatted": "N/A", "formatted_brl": "N/A", "date": "N/A", "airline": "Azul"}
-    best_gol = {"price": float('inf'), "formatted": "N/A", "formatted_brl": "N/A", "date": "N/A", "airline": "GOL"}
+    best_azul = {"price": float('inf'), "brl_value": float('inf'), "formatted": "N/A", "formatted_brl": "N/A", "date": "N/A", "airline": "Azul"}
+    best_gol = {"price": float('inf'), "brl_value": float('inf'), "formatted": "N/A", "formatted_brl": "N/A", "date": "N/A", "airline": "GOL"}
 
     logger.info(f"SEARCH_START origin={ORIGIN} dest={DESTINATION} start={SEARCH_START_DAY} end={SEARCH_END_DAY} interval={INTERVAL_DAYS}")
     total_offers = 0
@@ -306,25 +311,25 @@ def search_prices(client: DuffelClient) -> Tuple[Dict, Dict]:
                 formatted_brl, brl_value = convert_currency(price_raw, currency)
                 formatted_orig = f"{currency} {price_raw:.2f}"
 
-                if is_azul and price_raw < best_azul["price"]:
+                if is_azul and brl_value < best_azul["brl_value"]:
                     best_azul = {
                         "price": price_raw,
+                        "brl_value": brl_value,
                         "formatted": formatted_orig,
                         "formatted_brl": formatted_brl,
                         "date": target_date,
-                        "airline": "Azul",
-                        "brl_value": brl_value
+                        "airline": "Azul"
                     }
                     logger.info(f"BEST_AZUL price={price_raw:.2f} {currency} brl={brl_value:.2f} date={target_date}")
 
-                if is_gol and price_raw < best_gol["price"]:
+                if is_gol and brl_value < best_gol["brl_value"]:
                     best_gol = {
                         "price": price_raw,
+                        "brl_value": brl_value,
                         "formatted": formatted_orig,
                         "formatted_brl": formatted_brl,
                         "date": target_date,
-                        "airline": "GOL",
-                        "brl_value": brl_value
+                        "airline": "GOL"
                     }
                     logger.info(f"BEST_GOL price={price_raw:.2f} {currency} brl={brl_value:.2f} date={target_date}")
             except Exception:
@@ -355,7 +360,7 @@ def send_email(azul: Dict, gol: Dict) -> bool:
 
         html = f"""
         <html><body style="font-family: Arial, sans-serif;">
-        <h2>✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.9)</h2>
+        <h2>✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.10)</h2>
         <p><strong>Rota:</strong> {ORIGIN} → {DESTINATION}</p>
         <p><strong>Janela:</strong> D+{SEARCH_START_DAY} até D+{SEARCH_END_DAY}, a cada {INTERVAL_DAYS} dias</p><hr>
         <h3>🔵 AZUL</h3><p><strong>Preço:</strong> {azul['formatted_brl']}</p><p><strong>Data:</strong> {azul['date']}</p><hr>
@@ -382,7 +387,7 @@ def send_telegram(azul: Dict, gol: Dict) -> bool:
             logger.error("TELEGRAM_SKIP reason=missing_env")
             return False
 
-        msg_text = f"""✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.9)
+        msg_text = f"""✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.10)
 
 🔵 AZUL: {azul['formatted_brl']}
 📅 Data: {azul['date']}
@@ -414,7 +419,7 @@ Janela: D+{SEARCH_START_DAY} a D+{SEARCH_END_DAY} / {INTERVAL_DAYS} em {INTERVAL
 
 def main():
     logger.info("=" * 60)
-    logger.info("🚀 Script v20.9 - Duffel Edition SEGURA")
+    logger.info("🚀 Script v20.10 - Duffel Edition SEGURA")
     logger.info("=" * 60)
 
     token = os.getenv("DUFFEL_ACCESS_TOKEN")
@@ -429,7 +434,7 @@ def main():
         logger.error(f"SEARCH_EXC exc={type(e).__name__}")
         sys.exit(1)
 
-    msg_text = f"✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.9):\n\n🔵 AZUL: {azul['formatted_brl']} (Data: {azul['date']})\n🟠 GOL: {gol['formatted_brl']} (Data: {gol['date']})\n\nRota: {ORIGIN} → {DESTINATION}\nJanela: D+{SEARCH_START_DAY} a D+{SEARCH_END_DAY} / {INTERVAL_DAYS}d\nVersão API usada: {client.working_version}\nGerado: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
+    msg_text = f"✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.10):\n\n🔵 AZUL: {azul['formatted_brl']} (Data: {azul['date']})\n🟠 GOL: {gol['formatted_brl']} (Data: {gol['date']})\n\nRota: {ORIGIN} → {DESTINATION}\nJanela: D+{SEARCH_START_DAY} a D+{SEARCH_END_DAY} / {INTERVAL_DAYS}d\nVersão API usada: {client.working_version}\nGerado: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
     logger.info("\n" + msg_text)
 
     result = {"timestamp": datetime.now().isoformat(), "origin": ORIGIN, "destination": DESTINATION, "azul": azul, "gol": gol, "version": client.working_version}
@@ -454,6 +459,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
