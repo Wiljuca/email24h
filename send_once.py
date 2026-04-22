@@ -31,11 +31,12 @@ logger = logging.getLogger(__name__)
 # ============================================
 
 DUFFEL_API_BASE = "https://api.duffel.com/air"
-DUFFEL_VERSION = "2025-02-17" # Versão atual. Duffel muda a cada 2-3 meses
+DUFFEL_VERSION = "2025-02-17" # Versão atual. cabin_class foi removido aqui
 ORIGIN = "CGB"
 DESTINATION = "OPS"
-SEARCH_DAYS = 45
-INTERVAL_DAYS = 5
+SEARCH_START_DAY = 1 # Começa amanhã
+SEARCH_END_DAY = 45 # Vai até D+45
+INTERVAL_DAYS = 5 # De 5 em 5 dias: 1,6,11,16,21,26,31,36,41
 MAX_RETRIES = 3
 RETRY_DELAY = 2
 CACHE_DIR = Path("/tmp/duffel_cache")
@@ -103,7 +104,7 @@ class DuffelClient:
             "Authorization": f"Bearer {self.token}",
             "Duffel-Version": DUFFEL_VERSION,
             "Content-Type": "application/json",
-            "User-Agent": "DuffelMonitor/v20.1"
+            "User-Agent": "DuffelMonitor/v20.2"
         }
         data = json.dumps(body).encode("utf-8") if body else None
 
@@ -123,7 +124,6 @@ class DuffelClient:
                 error_json = json.loads(error_body)
                 err_obj = error_json.get('errors', [{}])[0]
                 err_type = err_obj.get('type', 'unknown')
-                # Logamos só o title, nunca detail/request_id/meta
                 err_title = err_obj.get('title', '')
             except Exception:
                 pass
@@ -145,29 +145,30 @@ class DuffelClient:
             return None
 
 # ============================================
-# BUSCA COM SCHEMA CORRETO DA VERSÃO 2025-02-17
+# BUSCA SEM cabin_class - SCHEMA 2025-02-17
 # ============================================
 
 def search_prices(client: DuffelClient) -> Tuple[Dict, Dict]:
     best_azul = {"price": float('inf'), "formatted": "N/A", "date": "N/A", "airline": "Azul"}
     best_gol = {"price": float('inf'), "formatted": "N/A", "date": "N/A", "airline": "GOL"}
 
-    logger.info(f"SEARCH_START origin={ORIGIN} dest={DESTINATION} days={SEARCH_DAYS} interval={INTERVAL_DAYS}")
+    logger.info(f"SEARCH_START origin={ORIGIN} dest={DESTINATION} start={SEARCH_START_DAY} end={SEARCH_END_DAY} interval={INTERVAL_DAYS}")
     total_offers = 0
     zero_offers_requests = 0
+    dates_checked = 0
 
-    for i in range(1, SEARCH_DAYS + 1, INTERVAL_DAYS):
+    for i in range(SEARCH_START_DAY, SEARCH_END_DAY + 1, INTERVAL_DAYS):
         target_date = (datetime.now() + timedelta(days=i)).strftime("%Y-%m-%d")
-        logger.info(f"SEARCH_DATE date={target_date}")
+        dates_checked += 1
+        logger.info(f"SEARCH_DATE date={target_date} step={dates_checked}")
 
-        # CORREÇÃO: cabin_class agora vai dentro do slice
+        # SCHEMA NOVO: sem cabin_class. Duffel retorna todas as classes e você filtra depois se quiser
         search_body = {
             "data": {
                 "slices": [{
                     "origin": ORIGIN,
                     "destination": DESTINATION,
-                    "departure_date": target_date,
-                    "cabin_class": "economy" # <-- MUDOU AQUI
+                    "departure_date": target_date
                 }],
                 "passengers": [{"type": "adult"}]
             }
@@ -199,6 +200,11 @@ def search_prices(client: DuffelClient) -> Tuple[Dict, Dict]:
         total_offers += len(offers)
         for offer in offers:
             try:
+                # Filtra só economy se vier no offer
+                slice_cabin = offer.get("slices", [{}])[0].get("cabin_class", "")
+                if slice_cabin and slice_cabin!= "economy":
+                    continue
+
                 price_raw = float(offer.get("total_amount", float('inf')))
                 currency = offer.get("total_currency", "BRL")
                 owner = offer.get("owner", {})
@@ -219,7 +225,7 @@ def search_prices(client: DuffelClient) -> Tuple[Dict, Dict]:
                 continue
         time.sleep(0.5)
 
-    logger.info(f"SEARCH_END total_offers={total_offers} zero_offers_requests={zero_offers_requests}")
+    logger.info(f"SEARCH_END total_offers={total_offers} zero_offers_requests={zero_offers_requests} dates_checked={dates_checked}")
     if total_offers == 0:
         logger.error("SEARCH_FAIL reason=no_inventory_or_test_token")
     return best_azul, best_gol
@@ -243,8 +249,9 @@ def send_email(azul: Dict, gol: Dict) -> bool:
 
         html = f"""
         <html><body style="font-family: Arial, sans-serif;">
-        <h2>✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.1)</h2>
-        <p><strong>Rota:</strong> {ORIGIN} → {DESTINATION}</p><hr>
+        <h2>✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.2)</h2>
+        <p><strong>Rota:</strong> {ORIGIN} → {DESTINATION}</p>
+        <p><strong>Janela:</strong> D+{SEARCH_START_DAY} até D+{SEARCH_END_DAY}, a cada {INTERVAL_DAYS} dias</p><hr>
         <h3>🔵 AZUL</h3><p><strong>Preço:</strong> {azul['formatted']}</p><p><strong>Data:</strong> {azul['date']}</p><hr>
         <h3>🟠 GOL</h3><p><strong>Preço:</strong> {gol['formatted']}</p><p><strong>Data:</strong> {gol['date']}</p><hr>
         <p><small>Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}</small></p>
@@ -269,7 +276,7 @@ def send_telegram(azul: Dict, gol: Dict) -> bool:
             logger.error("TELEGRAM_SKIP reason=missing_env")
             return False
 
-        msg_text = f"""✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.1)
+        msg_text = f"""✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.2)
 
 🔵 AZUL: {azul['formatted']}
 📅 Data: {azul['date']}
@@ -278,6 +285,7 @@ def send_telegram(azul: Dict, gol: Dict) -> bool:
 📅 Data: {gol['date']}
 
 Rota: {ORIGIN} → {DESTINATION}
+Janela: D+{SEARCH_START_DAY} a D+{SEARCH_END_DAY} / {INTERVAL_DAYS} em {INTERVAL_DAYS} dias
 ⏰ {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"""
 
         url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -300,7 +308,7 @@ Rota: {ORIGIN} → {DESTINATION}
 
 def main():
     logger.info("=" * 60)
-    logger.info("🚀 Script v20.1 - Duffel Edition SEGURA")
+    logger.info("🚀 Script v20.2 - Duffel Edition SEGURA")
     logger.info("=" * 60)
 
     token = os.getenv("DUFFEL_ACCESS_TOKEN")
@@ -315,7 +323,7 @@ def main():
         logger.error(f"SEARCH_EXC exc={type(e).__name__}")
         sys.exit(1)
 
-    msg_text = f"✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.1):\n\n🔵 AZUL: {azul['formatted']} (Data: {azul['date']})\n🟠 GOL: {gol['formatted']} (Data: {gol['date']})\n\nRota: {ORIGIN} → {DESTINATION}\nVersão API: {DUFFEL_VERSION}\nGerado: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
+    msg_text = f"✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.2):\n\n🔵 AZUL: {azul['formatted']} (Data: {azul['date']})\n🟠 GOL: {gol['formatted']} (Data: {gol['date']})\n\nRota: {ORIGIN} → {DESTINATION}\nJanela: D+{SEARCH_START_DAY} a D+{SEARCH_END_DAY} / {INTERVAL_DAYS}d\nVersão API: {DUFFEL_VERSION}\nGerado: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
     logger.info("\n" + msg_text)
 
     result = {"timestamp": datetime.now().isoformat(), "origin": ORIGIN, "destination": DESTINATION, "azul": azul, "gol": gol}
@@ -340,6 +348,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
