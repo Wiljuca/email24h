@@ -31,12 +31,12 @@ logger = logging.getLogger(__name__)
 # ============================================
 
 DUFFEL_API_BASE = "https://api.duffel.com/air"
-DUFFEL_VERSION = "2025-02-17" # Versão atual. cabin_class foi removido aqui
+DUFFEL_VERSION = "2025-02-17"
 ORIGIN = "CGB"
 DESTINATION = "OPS"
-SEARCH_START_DAY = 1 # Começa amanhã
-SEARCH_END_DAY = 45 # Vai até D+45
-INTERVAL_DAYS = 5 # De 5 em 5 dias: 1,6,11,16,21,26,31,36,41
+SEARCH_START_DAY = 1
+SEARCH_END_DAY = 45
+INTERVAL_DAYS = 5
 MAX_RETRIES = 3
 RETRY_DELAY = 2
 CACHE_DIR = Path("/tmp/duffel_cache")
@@ -104,7 +104,7 @@ class DuffelClient:
             "Authorization": f"Bearer {self.token}",
             "Duffel-Version": DUFFEL_VERSION,
             "Content-Type": "application/json",
-            "User-Agent": "DuffelMonitor/v20.2"
+            "User-Agent": "DuffelMonitor/v20.3"
         }
         data = json.dumps(body).encode("utf-8") if body else None
 
@@ -119,15 +119,20 @@ class DuffelClient:
         except urllib.error.HTTPError as e:
             err_type = "unknown"
             err_title = ""
+            err_detail = ""
             try:
                 error_body = e.read().decode("utf-8")
                 error_json = json.loads(error_body)
                 err_obj = error_json.get('errors', [{}])[0]
                 err_type = err_obj.get('type', 'unknown')
                 err_title = err_obj.get('title', '')
+                # Sanitiza o detail: pega só os primeiros 80 chars e remove possíveis IDs
+                detail_raw = err_obj.get('detail', '')
+                if detail_raw:
+                    err_detail = detail_raw[:80].replace('req_', 'req_***').replace('orq_', 'orq_***')
             except Exception:
                 pass
-            logger.error(f"API_ERR method={method} endpoint={endpoint} status={e.code} type={err_type} title={err_title}")
+            logger.error(f"API_ERR method={method} endpoint={endpoint} status={e.code} type={err_type} title={err_title} detail={err_detail}")
 
             if (e.code >= 500 or e.code == 429) and retry_count < MAX_RETRIES:
                 wait_time = RETRY_DELAY * (2 ** retry_count)
@@ -145,7 +150,7 @@ class DuffelClient:
             return None
 
 # ============================================
-# BUSCA SEM cabin_class - SCHEMA 2025-02-17
+# BUSCA - PAYLOAD MÍNIMO VÁLIDO PARA 2025-02-17
 # ============================================
 
 def search_prices(client: DuffelClient) -> Tuple[Dict, Dict]:
@@ -162,7 +167,7 @@ def search_prices(client: DuffelClient) -> Tuple[Dict, Dict]:
         dates_checked += 1
         logger.info(f"SEARCH_DATE date={target_date} step={dates_checked}")
 
-        # SCHEMA NOVO: sem cabin_class. Duffel retorna todas as classes e você filtra depois se quiser
+        # PAYLOAD MÍNIMO: sem cabin_class, sem nada opcional
         search_body = {
             "data": {
                 "slices": [{
@@ -200,11 +205,6 @@ def search_prices(client: DuffelClient) -> Tuple[Dict, Dict]:
         total_offers += len(offers)
         for offer in offers:
             try:
-                # Filtra só economy se vier no offer
-                slice_cabin = offer.get("slices", [{}])[0].get("cabin_class", "")
-                if slice_cabin and slice_cabin!= "economy":
-                    continue
-
                 price_raw = float(offer.get("total_amount", float('inf')))
                 currency = offer.get("total_currency", "BRL")
                 owner = offer.get("owner", {})
@@ -249,11 +249,11 @@ def send_email(azul: Dict, gol: Dict) -> bool:
 
         html = f"""
         <html><body style="font-family: Arial, sans-serif;">
-        <h2>✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.2)</h2>
+        <h2>✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.3)</h2>
         <p><strong>Rota:</strong> {ORIGIN} → {DESTINATION}</p>
         <p><strong>Janela:</strong> D+{SEARCH_START_DAY} até D+{SEARCH_END_DAY}, a cada {INTERVAL_DAYS} dias</p><hr>
         <h3>🔵 AZUL</h3><p><strong>Preço:</strong> {azul['formatted']}</p><p><strong>Data:</strong> {azul['date']}</p><hr>
-        <h3>🟠 GOL</h3><p><strong>Preço:</strong> {gol['formatted']}</p><p><strong>Data:</strong> {gol['date']}</p><hr>
+        <h3>🟠 GOL</h3><p><strong>Preço:</strong> {gol['formatted']}</p><strong>Data:</strong> {gol['date']}</p><hr>
         <p><small>Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}</small></p>
         </body></html>
         """
@@ -276,7 +276,7 @@ def send_telegram(azul: Dict, gol: Dict) -> bool:
             logger.error("TELEGRAM_SKIP reason=missing_env")
             return False
 
-        msg_text = f"""✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.2)
+        msg_text = f"""✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.3)
 
 🔵 AZUL: {azul['formatted']}
 📅 Data: {azul['date']}
@@ -308,7 +308,7 @@ Janela: D+{SEARCH_START_DAY} a D+{SEARCH_END_DAY} / {INTERVAL_DAYS} em {INTERVAL
 
 def main():
     logger.info("=" * 60)
-    logger.info("🚀 Script v20.2 - Duffel Edition SEGURA")
+    logger.info("🚀 Script v20.3 - Duffel Edition SEGURA")
     logger.info("=" * 60)
 
     token = os.getenv("DUFFEL_ACCESS_TOKEN")
@@ -323,7 +323,7 @@ def main():
         logger.error(f"SEARCH_EXC exc={type(e).__name__}")
         sys.exit(1)
 
-    msg_text = f"✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.2):\n\n🔵 AZUL: {azul['formatted']} (Data: {azul['date']})\n🟠 GOL: {gol['formatted']} (Data: {gol['date']})\n\nRota: {ORIGIN} → {DESTINATION}\nJanela: D+{SEARCH_START_DAY} a D+{SEARCH_END_DAY} / {INTERVAL_DAYS}d\nVersão API: {DUFFEL_VERSION}\nGerado: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
+    msg_text = f"✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.3):\n\n🔵 AZUL: {azul['formatted']} (Data: {azul['date']})\n🟠 GOL: {gol['formatted']} (Data: {gol['date']})\n\nRota: {ORIGIN} → {DESTINATION}\nJanela: D+{SEARCH_START_DAY} a D+{SEARCH_END_DAY} / {INTERVAL_DAYS}d\nVersão API: {DUFFEL_VERSION}\nGerado: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
     logger.info("\n" + msg_text)
 
     result = {"timestamp": datetime.now().isoformat(), "origin": ORIGIN, "destination": DESTINATION, "azul": azul, "gol": gol}
@@ -348,5 +348,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
