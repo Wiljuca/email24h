@@ -16,7 +16,7 @@ from email.mime.multipart import MIMEMultipart
 import hashlib
 
 # ============================================
-# LOGGING
+# LOGGING SEGURO
 # ============================================
 
 logging.basicConfig(
@@ -31,8 +31,7 @@ logger = logging.getLogger(__name__)
 # ============================================
 
 DUFFEL_API_BASE = "https://api.duffel.com/air"
-# Tentamos estas versões em ordem até uma funcionar
-DUFFEL_VERSIONS_TO_TRY = ["2025-02-17", "v2", "2024-12-01"]
+DUFFEL_VERSIONS_TO_TRY = ["v2", "2025-02-17", "2024-12-01"]
 ORIGIN = "CGB"
 DESTINATION = "OPS"
 SEARCH_START_DAY = 1
@@ -44,8 +43,51 @@ CACHE_DIR = Path("/tmp/duffel_cache")
 CACHE_EXPIRY = 3600
 POLLING_ATTEMPTS = 4
 POLLING_DELAY = 1.5
+CURRENCY_CACHE = {} # Cache de cotação pra não bater na API toda hora
 
 CACHE_DIR.mkdir(exist_ok=True)
+
+# ============================================
+# COTAÇÃO DE MOEDAS
+# ============================================
+
+def get_exchange_rate(from_currency: str, to_currency: str = "BRL") -> Optional[float]:
+    """Busca cotação do dia. Cache em memória durante a execução."""
+    if from_currency == to_currency:
+        return 1.0
+
+    cache_key = f"{from_currency}_{to_currency}"
+    if cache_key in CURRENCY_CACHE:
+        return CURRENCY_CACHE[cache_key]
+
+    try:
+        # API gratuita, sem chave. Atualiza 1x por dia
+        url = f"https://api.exchangerate.host/convert?from={from_currency}&to={to_currency}&amount=1"
+        req = urllib.request.Request(url, headers={"User-Agent": "DuffelMonitor/v20.5"})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8"))
+            rate = data.get("result")
+            if rate:
+                CURRENCY_CACHE[cache_key] = float(rate)
+                logger.info(f"CURRENCY_RATE from={from_currency} to={to_currency} rate={rate:.4f}")
+                return float(rate)
+    except Exception as e:
+        logger.error(f"CURRENCY_ERR from={from_currency} to={to_currency} exc={type(e).__name__}")
+
+    return None
+
+def convert_currency(amount: float, from_currency: str) -> Tuple[str, float]:
+    """Converte pra BRL e retorna string formatada + valor float"""
+    if from_currency == "BRL":
+        return f"R$ {amount:.2f}", amount
+
+    rate = get_exchange_rate(from_currency, "BRL")
+    if not rate:
+        # Se falhar cotação, mostra original
+        return f"{from_currency} {amount:.2f}", amount
+
+    brl_amount = amount * rate
+    return f"R$ {brl_amount:.2f} ({from_currency} {amount:.2f})", brl_amount
 
 # ============================================
 # CACHE
@@ -84,7 +126,7 @@ class DuffelCache:
             pass
 
 # ============================================
-# CLIENTE COM FALLBACK DE VERSÃO
+# CLIENTE DUFFEL
 # ============================================
 
 class DuffelClient:
@@ -93,7 +135,6 @@ class DuffelClient:
         self.working_version = None
 
     def _try_version(self, version: str, endpoint: str, method: str, body: Optional[Dict]) -> Tuple[Optional[Dict], Optional[str]]:
-        """Tenta uma versão específica. Retorna (response, error_reason)"""
         cache_key = {"endpoint": endpoint, "method": method, "body": body}
         cached_response = DuffelCache.get(endpoint, cache_key, version)
         if cached_response:
@@ -105,7 +146,7 @@ class DuffelClient:
             "Authorization": f"Bearer {self.token}",
             "Duffel-Version": version,
             "Content-Type": "application/json",
-            "User-Agent": "DuffelMonitor/v20.4"
+            "User-Agent": "DuffelMonitor/v20.5"
         }
         data = json.dumps(body).encode("utf-8") if body else None
 
@@ -133,11 +174,10 @@ class DuffelClient:
                     err_detail = detail_raw[:80].replace('req_', 'req_***').replace('orq_', 'orq_***')
             except Exception:
                 pass
+            logger.error(f"API_ERR method={method} endpoint={endpoint} status={e.code} type={err_type} title={err_title} detail={err_detail} version={version}")
 
             if err_title == "Unsupported version":
                 return None, "unsupported_version"
-
-            logger.error(f"API_ERR method={method} endpoint={endpoint} status={e.code} type={err_type} title={err_title} detail={err_detail} version={version}")
             return None, f"{err_type}:{err_title}"
 
         except Exception as e:
@@ -147,7 +187,6 @@ class DuffelClient:
     def call_api(self, endpoint: str, method: str = "GET", body: Optional[Dict] = None,
                  retry_count: int = 0) -> Optional[Dict]:
 
-        # Se já descobrimos uma versão que funciona, usa ela direto
         versions_to_try = [self.working_version] if self.working_version else DUFFEL_VERSIONS_TO_TRY
 
         for version in versions_to_try:
@@ -160,10 +199,8 @@ class DuffelClient:
                 logger.warning(f"VERSION_SKIP version={version} reason=unsupported")
                 continue
             else:
-                # Se não é erro de versão, não adianta tentar outra
                 break
 
-        # Retry só para 5xx
         if retry_count < MAX_RETRIES:
             wait_time = RETRY_DELAY * (2 ** retry_count)
             logger.info(f"RETRY attempt={retry_count + 1}/{MAX_RETRIES} wait={wait_time}s")
@@ -173,12 +210,12 @@ class DuffelClient:
         return None
 
 # ============================================
-# BUSCA
+# BUSCA COM CONVERSÃO
 # ============================================
 
-def search_prices(client: DuffelClient) -> Tuple[Dict, Dict]:
-    best_azul = {"price": float('inf'), "formatted": "N/A", "date": "N/A", "airline": "Azul"}
-    best_gol = {"price": float('inf'), "formatted": "N/A", "date": "N/A", "airline": "GOL"}
+def search_prices(client: DuffelClient) -> Tuple[Dict][Dict]:
+    best_azul = {"price": float('inf'), "formatted": "N/A", "formatted_brl": "N/A", "date": "N/A", "airline": "Azul"}
+    best_gol = {"price": float('inf'), "formatted": "N/A", "formatted_brl": "N/A", "date": "N/A", "airline": "GOL"}
 
     logger.info(f"SEARCH_START origin={ORIGIN} dest={DESTINATION} start={SEARCH_START_DAY} end={SEARCH_END_DAY} interval={INTERVAL_DAYS}")
     total_offers = 0
@@ -236,13 +273,31 @@ def search_prices(client: DuffelClient) -> Tuple[Dict, Dict]:
                 is_azul = "AZUL" in name or code == "AD"
                 is_gol = "GOL" in name or code == "G3"
 
+                # Converte pra BRL aqui
+                formatted_brl, brl_value = convert_currency(price_raw, currency)
+                formatted_orig = f"{currency} {price_raw:.2f}"
+
                 if is_azul and price_raw < best_azul["price"]:
-                    best_azul = {"price": price_raw, "formatted": f"{currency} {price_raw:.2f}", "date": target_date, "airline": "Azul"}
-                    logger.info(f"BEST_AZUL price={price_raw:.2f} date={target_date}")
+                    best_azul = {
+                        "price": price_raw,
+                        "formatted": formatted_orig,
+                        "formatted_brl": formatted_brl,
+                        "date": target_date,
+                        "airline": "Azul",
+                        "brl_value": brl_value
+                    }
+                    logger.info(f"BEST_AZUL price={price_raw:.2f} {currency} brl={brl_value:.2f} date={target_date}")
 
                 if is_gol and price_raw < best_gol["price"]:
-                    best_gol = {"price": price_raw, "formatted": f"{currency} {price_raw:.2f}", "date": target_date, "airline": "GOL"}
-                    logger.info(f"BEST_GOL price={price_raw:.2f} date={target_date}")
+                    best_gol = {
+                        "price": price_raw,
+                        "formatted": formatted_orig,
+                        "formatted_brl": formatted_brl,
+                        "date": target_date,
+                        "airline": "GOL",
+                        "brl_value": brl_value
+                    }
+                    logger.info(f"BEST_GOL price={price_raw:.2f} {currency} brl={brl_value:.2f} date={target_date}")
             except Exception:
                 continue
         time.sleep(0.5)
@@ -253,7 +308,7 @@ def search_prices(client: DuffelClient) -> Tuple[Dict, Dict]:
     return best_azul, best_gol
 
 # ============================================
-# NOTIFICAÇÕES
+# NOTIFICAÇÕES COM BRL
 # ============================================
 
 def send_email(azul: Dict, gol: Dict) -> bool:
@@ -271,12 +326,12 @@ def send_email(azul: Dict, gol: Dict) -> bool:
 
         html = f"""
         <html><body style="font-family: Arial, sans-serif;">
-        <h2>✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.4)</h2>
+        <h2>✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.5)</h2>
         <p><strong>Rota:</strong> {ORIGIN} → {DESTINATION}</p>
         <p><strong>Janela:</strong> D+{SEARCH_START_DAY} até D+{SEARCH_END_DAY}, a cada {INTERVAL_DAYS} dias</p><hr>
-        <h3>🔵 AZUL</h3><p><strong>Preço:</strong> {azul['formatted']}</p><strong>Data:</strong> {azul['date']}</p><hr>
-        <h3>🟠 GOL</h3><p><strong>Preço:</strong> {gol['formatted']}</p><p><strong>Data:</strong> {gol['date']}</p><hr>
-        <p><small>Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}</small></p>
+        <h3>🔵 AZUL</h3><p><strong>Preço:</strong> {azul['formatted_brl']}</p><strong>Data:</strong> {azul['date']}</p><hr>
+        <h3>🟠 GOL</h3><p><strong>Preço:</strong> {gol['formatted_brl']}</p><p><strong>Data:</strong> {gol['date']}</p><hr>
+        <p><small>Conversão via exchangerate.host em {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}</small></p>
         </body></html>
         """
         msg.attach(MIMEText(html, "html"))
@@ -298,12 +353,12 @@ def send_telegram(azul: Dict, gol: Dict) -> bool:
             logger.error("TELEGRAM_SKIP reason=missing_env")
             return False
 
-        msg_text = f"""✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.4)
+        msg_text = f"""✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.5)
 
-🔵 AZUL: {azul['formatted']}
+🔵 AZUL: {azul['formatted_brl']}
 📅 Data: {azul['date']}
 
-🟠 GOL: {gol['formatted']}
+🟠 GOL: {gol['formatted_brl']}
 📅 Data: {gol['date']}
 
 Rota: {ORIGIN} → {DESTINATION}
@@ -330,7 +385,7 @@ Janela: D+{SEARCH_START_DAY} a D+{SEARCH_END_DAY} / {INTERVAL_DAYS} em {INTERVAL
 
 def main():
     logger.info("=" * 60)
-    logger.info("🚀 Script v20.4 - Duffel Edition SEGURA")
+    logger.info("🚀 Script v20.5 - Duffel Edition SEGURA")
     logger.info("=" * 60)
 
     token = os.getenv("DUFFEL_ACCESS_TOKEN")
@@ -345,7 +400,7 @@ def main():
         logger.error(f"SEARCH_EXC exc={type(e).__name__}")
         sys.exit(1)
 
-    msg_text = f"✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.4):\n\n🔵 AZUL: {azul['formatted']} (Data: {azul['date']})\n🟠 GOL: {gol['formatted']} (Data: {gol['date']})\n\nRota: {ORIGIN} → {DESTINATION}\nJanela: D+{SEARCH_START_DAY} a D+{SEARCH_END_DAY} / {INTERVAL_DAYS}d\nVersão API usada: {client.working_version}\nGerado: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
+    msg_text = f"✈️ MELHORES PREÇOS - DUFFEL EDITION (v20.5):\n\n🔵 AZUL: {azul['formatted_brl']} (Data: {azul['date']})\n🟠 GOL: {gol['formatted_brl']} (Data: {gol['date']})\n\nRota: {ORIGIN} → {DESTINATION}\nJanela: D+{SEARCH_START_DAY} a D+{SEARCH_END_DAY} / {INTERVAL_DAYS}d\nVersão API usada: {client.working_version}\nGerado: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
     logger.info("\n" + msg_text)
 
     result = {"timestamp": datetime.now().isoformat(), "origin": ORIGIN, "destination": DESTINATION, "azul": azul, "gol": gol, "version": client.working_version}
